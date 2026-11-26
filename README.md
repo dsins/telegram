@@ -58,6 +58,9 @@ telegram ask "Hangi branch deploy edilsin?"
 
 # 4. Son 24 saatte bota yazdığın mesajları listele
 telegram list
+
+# 5. Canlı dinleme: yeni mesaj gelene kadar bekle (cursor saklar, 409/ağ hatasında kopmaz, foto/dosya indirir)
+telegram wait --cursor ~/.local/state/ds-telegram/cursor.json --download /tmp/tg-inbox
 ```
 
 > **Not:** Çok uzun metinler sohbeti kirletmemek için otomatik olarak `.txt` dosyası şeklinde gönderilir.

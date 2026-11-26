@@ -161,6 +161,132 @@ def text_of(m):
     return f'[{kind}] {text}'.strip() if kind else text
 
 
+def download_media(m, dest_dir):
+    """Download photo/document/voice/audio from a message into dest_dir; returns local path or None."""
+    if not dest_dir:
+        return None
+    file_id = name = None
+    if m.get('photo'):
+        file_id = m['photo'][-1]['file_id']
+        name = f"{m['message_id']}.jpg"
+    elif m.get('document'):
+        file_id = m['document']['file_id']
+        name = f"{m['message_id']}-{os.path.basename(m['document'].get('file_name') or 'file')}"
+    elif m.get('voice'):
+        file_id = m['voice']['file_id']
+        name = f"{m['message_id']}.ogg"
+    elif m.get('audio'):
+        file_id = m['audio']['file_id']
+        name = f"{m['message_id']}-{os.path.basename(m['audio'].get('file_name') or 'audio.mp3')}"
+    if not file_id:
+        return None
+    try:
+        info = api('getFile', {'file_id': file_id})
+        fp = info.get('file_path')
+        if not fp:
+            return None
+        os.makedirs(dest_dir, exist_ok=True)
+        out_path = os.path.join(dest_dir, name.replace('/', '_'))
+        with urllib.request.urlopen(f'{API}/file/bot{TOKEN}/{fp}', timeout=30) as r:
+            data = r.read()
+        with open(out_path, 'wb') as f:
+            f.write(data)
+        return out_path
+    except (TgError, OSError):
+        return None
+
+
+def read_cursor(path):
+    try:
+        with open(path) as f:
+            return int(json.load(f).get('last_update_id', 0))
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def write_cursor(path, update_id):
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    tmp = f'{path}.{os.getpid()}.tmp'
+    with open(tmp, 'w') as f:
+        json.dump({'last_update_id': int(update_id), 'ts': int(time.time())}, f)
+    os.replace(tmp, path)
+
+
+def cmd_wait(a):
+    """Block until one or more new messages arrive from the linked chat; resilient to 409/network blips."""
+    cursor_path = os.path.expanduser(a.cursor)
+    last_id = a.since if a.since is not None else read_cursor(cursor_path)
+
+    def fetch_safe():
+        backoff = a.interval
+        while True:
+            try:
+                return updates()
+            except OSError:
+                time.sleep(backoff)
+                backoff = min(backoff * 1.5, 15.0)
+            except TgError as e:
+                if e.code not in (409, 429) and e.code < 500:
+                    raise
+                time.sleep(backoff)
+                backoff = min(backoff * 1.5, 15.0)
+
+    if last_id is None:
+        ups = fetch_safe()
+        last_id = max((u['update_id'] for u in ups), default=0)
+        write_cursor(cursor_path, last_id)
+
+    deadline = (time.time() + a.timeout) if a.timeout > 0 else None
+    batch_until = None
+    collected = []
+
+    while True:
+        ups = fetch_safe()
+        fresh = [
+            u for u in ups
+            if u['update_id'] > last_id and u.get('message', {}).get('chat', {}).get('id') == CHAT
+        ]
+        if fresh:
+            collected.extend(fresh)
+            last_id = max(u['update_id'] for u in fresh)
+            write_cursor(cursor_path, last_id)
+            if batch_until is None:
+                batch_until = time.time() + a.batch
+        if collected and (a.batch <= 0 or time.time() >= batch_until):
+            out = []
+            for u in collected:
+                m = u['message']
+                saved = download_media(m, a.download)
+                r = m.get('reply_to_message')
+                item = {
+                    'update_id': u['update_id'],
+                    'message_id': m['message_id'],
+                    'date': m['date'],
+                    'text': text_of(m),
+                }
+                if saved:
+                    item['file'] = saved
+                if r:
+                    item['reply_to'] = (r.get('text') or r.get('caption') or '').split('\n', 1)[-1][:120]
+                out.append(item)
+            if a.json:
+                print(json.dumps(out, ensure_ascii=False))
+            else:
+                for it in out:
+                    line = time.strftime('%F %T', time.localtime(it['date'])) + '  ' + it['text']
+                    if 'file' in it:
+                        line += f"  [file: {it['file']}]"
+                    if 'reply_to' in it:
+                        line += f"  (reply to: {it['reply_to']})"
+                    print(line)
+            return
+        if deadline is not None and time.time() >= deadline:
+            sys.exit(124)
+        time.sleep(0.5 if collected else a.interval)
+
+
 def cmd_send(a):
     if not a.text and sys.stdin.isatty():
         sys.exit('usage: telegram send TEXT  (or pipe text in)')
@@ -268,6 +394,15 @@ def main():
     s = sub.add_parser('list', help='your messages of the last 24h')
     s.add_argument('n', nargs='?', type=int, default=10)
     s.set_defaults(fn=cmd_list)
+    s = sub.add_parser('wait', help='wait continuously for new incoming messages (persists cursor, retries errors)')
+    s.add_argument('--cursor', default='~/.local/state/ds-telegram/cursor.json', help='cursor file path')
+    s.add_argument('--since', type=int, default=None, help='override last seen update_id')
+    s.add_argument('-t', '--timeout', type=float, default=0, help='max seconds to wait (0 = forever, default)')
+    s.add_argument('--interval', type=float, default=2.5, help='poll interval seconds (default 2.5)')
+    s.add_argument('--batch', type=float, default=1.5, help='seconds to batch rapid consecutive messages')
+    s.add_argument('--download', default='', help='directory to save incoming photos/documents/voice')
+    s.add_argument('--json', action='store_true', help='print incoming messages as JSON')
+    s.set_defaults(fn=cmd_wait)
     s = sub.add_parser('setup', help='save the bot token and link your chat')
     s.add_argument('token', nargs='?')
     s.add_argument('chat_id', nargs='?', type=int)
