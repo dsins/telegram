@@ -1,4 +1,4 @@
-# 📲 telegram — Pocket Remote Control for Your Shell & AI Coding Agents
+# 📲 Telegram: Pocket Remote Control for Your Shell & AI Coding Agents
 
 Walk away from your keyboard without walking away from your work.
 
