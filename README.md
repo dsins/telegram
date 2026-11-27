@@ -155,7 +155,18 @@ telegram list
 | `TELEGRAM_CHAT_ID` | Linked private chat ID via env | — |
 | `TELEGRAM_LABEL` | Bold header on the first line of every message | `<hostname> · <folder>` |
 | `TELEGRAM_STATE_DIR` | Directory for `cursor.json`, `active.json`, and `inbox/` | `~/.local/state/telegram` |
+| `TELEGRAM_INBOX_TTL` | Auto-delete managed inbox files older than N seconds (`0` disables) | `86400` (24h) |
 | `TELEGRAM_OWNER` | Custom owner ID for `--resume` lock checks | `OPENCODE_SESSION_ID` / `CLAUDE_SESSION_ID` / `cwd` |
+
+---
+
+## 🧹 Performance & Zero Data Bloat
+
+Built to run 24/7 on tiny VPS instances without leaking memory or filling disks:
+
+- **Tiny footprint:** Idles on `select()` (~0% CPU, ~12–15 MB RAM, one Python process) and keeps only two tiny JSON state files (`cursor.json` and `active.json`, <1 KB total).
+- **No old-message replay or context bloat:** `cursor.json` tracks `last_update_id`, so old chat history is never re-processed, downloaded, or fed back into your AI agent. On the network side, updates stay unconfirmed so multiple devices can share one bot; Telegram automatically expires them after 24 hours (capped at the latest 100 updates, a few KB of JSON).
+- **Automatic inbox pruning:** Incoming photos, voice notes, and documents saved in the default `~/.local/state/telegram/inbox/` folder are automatically cleaned up after **24 hours** whenever `telegram watch` starts (custom `--download` directories are never touched).
 
 ---
 

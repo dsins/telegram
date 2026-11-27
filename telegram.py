@@ -27,6 +27,7 @@ API = os.environ.get('TELEGRAM_API', 'https://api.telegram.org')
 STATE_DIR = os.path.expanduser(os.environ.get('TELEGRAM_STATE_DIR', '~/.local/state/telegram'))
 DEFAULT_CURSOR = os.path.join(STATE_DIR, 'cursor.json')
 DEFAULT_INBOX = os.path.join(STATE_DIR, 'inbox')
+INBOX_TTL = int(os.environ.get('TELEGRAM_INBOX_TTL', 86400))  # auto-prune managed inbox files older than 24h
 ACTIVE_FILE = os.path.join(STATE_DIR, 'active.json')
 LABEL = os.environ.get('TELEGRAM_LABEL') or f'{socket.gethostname()} · {os.path.basename(os.getcwd())}'
 MAX_PARTS = 3  # longer text goes as a .txt file instead of a burst of messages
@@ -181,6 +182,22 @@ def text_of(m):
     text = m.get('text') or m.get('caption') or ''
     kind = next((k for k in ('photo', 'document', 'voice', 'video', 'audio', 'sticker') if k in m), None)
     return f'[{kind}] {text}'.strip() if kind else text
+
+
+def cleanup_inbox(dest_dir, ttl=INBOX_TTL):
+    """Remove files older than `ttl` seconds from the managed default inbox."""
+    if not dest_dir or ttl <= 0 or not os.path.isdir(dest_dir):
+        return
+    cutoff = time.time() - ttl
+    try:
+        for entry in os.scandir(dest_dir):
+            try:
+                if entry.is_file(follow_symlinks=False) and entry.stat().st_mtime < cutoff:
+                    os.unlink(entry.path)
+            except OSError:
+                pass
+    except OSError:
+        pass
 
 
 def download_media(m, dest_dir):
@@ -344,6 +361,8 @@ def cmd_watch(a):
     """Block until one or more new messages arrive; enforces single active local watcher with clean handoff."""
     cursor_path = os.path.expanduser(a.cursor)
     download_dir = '' if a.no_download else os.path.expanduser(a.download)
+    if download_dir and os.path.abspath(download_dir) == os.path.abspath(DEFAULT_INBOX):
+        cleanup_inbox(download_dir)
     my_owner = a.owner or default_owner()
     my_token = uuid.uuid4().hex
     prev = read_json(ACTIVE_FILE)
