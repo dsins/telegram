@@ -1,121 +1,183 @@
-# 📲 telegram — Terminal & AI Agent için Sıfır Bağımlılıklı Telegram Köprüsü
+# 📲 telegram — Pocket Remote Control for Your Shell & AI Coding Agents
 
-Bilgisayar başından kalktığında terminal işlerini, script'lerini veya **Claude Code** oturumlarını cebinden takip etmen, dosya alman ve **butonlu onay/cevap** vermen için tasarlanmış ultra hafif bir CLI aracı ve AI skill seti.
+Walk away from your keyboard without walking away from your work.
 
-- **Sıfır bağımlılık:** Sadece standart `python3` kütüphanelerini kullanır (`pip install` yok, ekstra paket yok, tek dosya).
-- **Çoklu cihaz & oturum dostu:** Mesaj kuyruğunu tüketmez (Telegram 24 saat tutar); aynı botu istediğin kadar sunucu ve bilgisayarda aynı anda kullanabilirsin. Her mesaj otomatik olarak **`makine · klasör`** başlığıyla gelir.
-- **Claude Code Skill'leri dahil:**
-  - `/tg` — Sen uzaktayken Claude çalışmaya devam eder, sonucu Telegram'dan yazar, kritik adımlarda (deploy, silme, push vb.) sana Telegram'dan butonlu soru sorup cevabını bekler.
-  - `/notification` — Claude kapalıyken bile arka planda (cron ile) çalışan akıllı nöbetçiler kurar (domain düşüşü, site çökmesi, stok/fiyat takibi, iş bitimi vb.) ve olay gerçekleşince Telegram'dan haber verir.
+`telegram` is a **single-file, zero-dependency Python 3 CLI** and **2-skill pack (`tgpush` + `tgwatch`)** that turns your own private Telegram bot into a live remote control for **OpenCode**, **Claude Code**, or any terminal script.
+
+- **Zero dependencies:** Pure Python 3 standard library. No `pip install`, no Node runtime, no cloud relay, no daemon.
+- **`watch` is the default:** Run `telegram` and it starts listening immediately — cursor saved, photos/docs/voice downloaded automatically.
+- **Bulletproof session handoff:** Open a new AI session and start `tgwatch` — it takes over in software, politely tells the old agent `[STOP]` so it never restarts, and cleans up the old watcher automatically.
+- **Multi-machine friendly:** Updates are never wiped on Telegram's side (Telegram keeps them 24h), and every message arrives headed with **`host · folder`**.
 
 ---
 
-## 🚀 Hızlı Kurulum (1 Dakika)
+## 🧠 Why I Built It This Way (The Story)
 
-### 1. İndir ve Kur
+I run multiple AI coding sessions across servers and projects, and I don't want to stay glued to a terminal waiting for builds, deploys, or long refactors. I wanted to grab a coffee, take a walk, and still nudge my agent, inspect a screenshot, or tap **Yes / No** on a deploy from my phone.
+
+When you actually use a Telegram bridge every day with AI agents, you hit four real-world walls fast. Every design decision in this repo comes directly from slamming into those walls:
+
+1. **Why one skill wasn't enough (`tgpush` vs `tgwatch`)**
+   At first, I crammed everything into a single `/tg` skill — "notify me when done" *and* "keep listening forever." Bad idea. Sometimes the agent started an infinite background listener when I only wanted a one-off ping; other times it stopped listening when I was out the door.
+   Splitting into two sharp skills fixed it overnight:
+   - **`/tgpush`** = fire-and-forget updates, files, and button approvals. No background listener, so **10 sessions can push in parallel** without ever stepping on each other.
+   - **`/tgwatch`** = live, two-way remote control. Exactly **one** session holds the mic at a time.
+   - And I dropped the separate cron-watcher skill I used to maintain. Why carry 80 lines of prompt template when `telegram send` is already a one-liner in any crontab?
+
+2. **Why `watch` is the default command**
+   Typing `telegram wait --cursor ... --download ...` gets old on day one. Live listening is the heart of the tool, so bare `telegram` (or `telegram watch`) just works out of the box with sensible defaults for cursor tracking and media downloads.
+
+3. **Why session handoff MUST be enforced in software (not left to the AI)**
+   Picture this: Session A is happily watching Telegram. You open Session B in another project and start `/tgwatch`.
+   - If you do nothing -> both sessions read the same message and fight over it.
+   - If you ask the AI to "remember to stop the other session" -> good luck, LLMs forget or don't even know Session A exists.
+   - If you just `kill` Session A's watcher -> Agent A sees an unexpected crash, thinks *"oh, network blip!"*, and **restarts `telegram watch`** — kicking off an endless tug-of-war between two AI agents!
+   - And you can't just send `/stop` over Telegram either, because **Telegram bots never receive their own messages in `getUpdates`**.
+
+   So `telegram watch` handles handoff deterministically in ~40 lines of standard Python:
+
+   ```text
+   Session B runs `telegram watch`
+     ├─ 1. Atomically claims ~/.local/state/telegram/active.json
+     ├─ 2. Sends SIGUSR1 to Session A's watcher PID (SIGTERM fallback if hung)
+     └─ 3. Session A's watcher wakes in <1ms, prints:
+             [STOP] Telegram watch handed off to another session (host · project-b).
+                    Stop listening and do NOT restart telegram watch.
+           and exits cleanly with exit code 10.
+   ```
+
+4. **What if Session A was busy working when Session B took over?**
+   Think about that edge case: Session A received a message, exited `watch`, and spent 3 minutes refactoring code. Meanwhile, you switched to Session B and started `/tgwatch`. When Session A finishes and tries to re-arm, it runs **`telegram watch --resume`**.
+   `--resume` checks `active.json`, sees Session B now owns the floor, prints `[STOP]` (exit code `10`), and quietly steps aside — **never stealing control back**.
+
+Simple. No daemon. No ports. No agent guesswork.
+
+---
+
+## ⚡ 60-Second Quickstart
+
+### 1. Clone & Install
 
 ```bash
-git clone git@github.com:dsins/telegram.git
+git clone https://github.com/dsins/telegram.git
 cd telegram
 ./install.sh
 ```
 
-> `install.sh` betiği `telegram` komutunu `~/.local/bin/telegram` altına bağlar ve Claude Code için `/tg` ile `/notification` skill'lerini `~/.claude/skills/` altına kopyalar.
+What `install.sh` does:
+- Symlinks `telegram.py` to `~/.local/bin/telegram` (and adds it to your `PATH` if needed).
+- Auto-detects **Claude Code** (`~/.claude`) and/or **OpenCode** (`~/.config/opencode`) and symlinks the `tgpush` + `tgwatch` skills (and `/tgpush`, `/tgwatch` slash commands for OpenCode). Because they're symlinks, `git pull` keeps everything updated automatically.
 
-### 2. Telegram Botunu Oluştur ve Bağla
+### 2. Create Your Bot & Link Your Chat
 
-1. Telegram'da **[@BotFather](https://t.me/BotFather)**'a git ve `/newbot` yazarak yeni bir bot oluştur (sana bir **HTTP API Token** verecek).
-2. Terminalde kurulum komutunu çalıştır:
+1. Open **[@BotFather](https://t.me/BotFather)** on Telegram, send `/newbot`, and copy the HTTP API token.
+2. Run:
    ```bash
    telegram setup
    ```
-3. İstendiğinde token'ı yapıştır, ardından telefonundan yeni oluşturduğun bota **herhangi bir mesaj** (`merhaba` vb.) gönder.
-4. Araç seni otomatik tanıyacak, ayarlarını `~/.config/ds/telegram.json` (`0600` izinli, repo dışı güvenli alan) dosyasına kaydedecek ve telefonuna **"✅ Connected"** mesajı atacak.
+3. Paste your token, then send any message (`hi`) to your new bot from your phone.
+4. Done! Credentials are stored locally in `~/.config/telegram/config.json` (`0600` permissions, outside the repo) and you'll get a **"✅ Connected"** ping on your phone.
 
-> **Başka bir sunucuya/bilgisayara eklerken:** Tekrar uğraşmana gerek yok; ya `~/.config/ds/telegram.json` dosyasını kopyala ya da doğrudan `telegram setup <TOKEN> <CHAT_ID>` komutunu çalıştır.
+> **Adding another server or laptop?** Copy `~/.config/telegram/config.json` over, or just run `telegram setup <TOKEN> <CHAT_ID>`.
 
 ---
 
-## 💻 CLI Kullanımı (`telegram`)
+## 🤖 Using the AI Agent Skills
 
-Herhangi bir terminalden, bash script'inden veya cron görevinden doğrudan çağırabilirsin:
+| Skill / Command | Best for | Runs `watch`? | Parallel sessions? |
+|---|---|---|---|
+| **`/tgpush`** | *"Run tests, fix errors, ask me before pushing, ping me when done."* | No | Yes (unlimited) |
+| **`/tgwatch`** | *"Heading out — keep listening so I can send tasks, screenshots, and voice notes from my phone."* | Yes (singleton) | Takes over cleanly |
+
+### `/tgpush` — Fire, Report & Ask
+```text
+/tgpush run the full test suite, fix any failures, and ask me on Telegram before git push
+```
+- Sends a crisp summary when finished (or at major milestones).
+- Risky steps (`deploy`, `push`, `delete`, `migration`) pop up as **Yes / No inline buttons** on your phone.
+- Safe to trigger across as many parallel terminals/sessions as you want.
+
+### `/tgwatch` — Live Two-Way Remote Control
+```text
+/tgwatch
+```
+- Announces itself on Telegram and starts `telegram watch` in the background.
+- Send text, screenshots, files, or voice notes from your phone — your agent inspects them, executes, replies, and immediately re-arms with `telegram watch --resume`.
+- Open `/tgwatch` in a *different* session anytime: the old session gets `[STOP]` automatically and bows out cleanly.
+- Send `/stop` on Telegram (or run `telegram stop` in any terminal) whenever you want to hang up.
+
+---
+
+## 💻 CLI Cheat Sheet
+
+Works great on its own in shell scripts, CI hooks, or cron jobs too:
 
 ```bash
-# 1. Mesaj gönder (düz metin veya pipe ile komut çıktısı)
-telegram send "Deploy tamamlandı 🚀"
-make test 2>&1 | tail -n 30 | telegram send
+# Watch for incoming messages (default command — bare `telegram` does the same!)
+telegram
+telegram watch --json                      # structured JSON output
+telegram watch --resume                    # re-arm only if this session still owns the lock
+telegram stop                              # cleanly stop the active local watcher
 
-# 2. Dosya gönder (rapor, log, ekran görüntüsü vb.)
-telegram file rapor.pdf "Haftalık özet raporu"
+# Send text (or pipe command output; very long text becomes a .txt attachment)
+telegram send "Build is green 🚀"
+pytest 2>&1 | tail -n 30 | telegram send
 
-# 3. Soru sor ve cevabı bekle (butonlu veya serbest yazılı)
-# Telefondan butona bastığında veya mesajı yanıtladığında cevabı ekrana basar ve çıkar:
-CEVAP=$(telegram ask "Prod'a çıkalım mı?" -o "Evet, çık" -o "Hayır, dur")
-echo "Seçilen: $CEVAP"
+# Send any file (report, screenshot, log)
+telegram file report.pdf "Weekly summary"
 
-# Serbest metin cevabı beklemek için (-o olmadan):
-telegram ask "Hangi branch deploy edilsin?"
+# Ask with inline buttons (blocks until tapped or replied, prints the answer)
+ANSWER=$(telegram ask "Deploy to production?" -o "Ship it" -o "Hold")
+echo "Chosen: $ANSWER"
 
-# 4. Son 24 saatte bota yazdığın mesajları listele
+# Ask for a free-text reply (omit -o)
+telegram ask "Which branch should I deploy?"
+
+# Read your messages from the last 24h
 telegram list
-
-# 5. Canlı dinleme: yeni mesaj gelene kadar bekle (cursor saklar, 409/ağ hatasında kopmaz, foto/dosya indirir)
-telegram wait --cursor ~/.local/state/ds-telegram/cursor.json --download /tmp/tg-inbox
 ```
 
-> **Not:** Çok uzun metinler sohbeti kirletmemek için otomatik olarak `.txt` dosyası şeklinde gönderilir.
+### Bonus: Cron Alerts in One Line (No Extra Skill Needed)
+
+```cron
+# Ping Telegram if your site stops returning HTTP 200
+*/5 * * * * curl -fsS https://example.com >/dev/null || TELEGRAM_LABEL="monitor · prod" $HOME/.local/bin/telegram send "🚨 example.com is down!"
+```
 
 ---
 
-## 🤖 Claude Code Skill'leri Nasıl Kullanılır?
+## ⚙️ Environment Variables (All Optional)
 
-`./install.sh` çalıştırdığında iki adet global skill (`~/.claude/skills/`) aktif olur:
-
-### 1. `/tg` — Uzaktan Çalışma ve Onay Modu
-
-Bilgisayar başından kalkarken Claude Code'a şöyle yazman yeterli:
-
-- `/tg testleri çalıştır, hataları düzelt ve sonucu yaz`
-- Ya da doğal dille: *"Projeyi derle, bitince telegramdan haber ver, prod'a atmadan önce onay al"*
-- Tek başına `/tg` yazarsan: Bota son yazdığın mesajı görev olarak okur ve yapmaya başlar!
-
-**Nasıl çalışır?**
-- İş bittiğinde veya önemli aşamalarda sana özet geçer.
-- Riskli bir adımda (`git push`, `rm`, migration, deploy) sana Telegram'dan **Evet / Hayır** butonlu soru gönderir ve sen telefondan basana kadar bekler.
-
-### 2. `/notification` — Arka Plan Takipçisi (Cron Watch)
-
-Claude Code'u kapatsan bile çalışmaya devam eden periyodik kontroller kurar:
-
-- `/notification example.com domaini düşerse haber ver`
-- `/notification https://sitem.com çökerse veya yavaşlarsa yaz`
-- `/notification liste` — Aktif takipleri ve durumlarını gösterir.
-- `/notification sil <ad>` — İlgili takibi kaldırır.
-
-**Nasıl çalışır?**
-- `~/.local/share/ds-watch/<ad>/check.sh` altında izole bir kontrol script'i oluşturup kullanıcı `crontab`'ına ekler.
-- Olay gerçekleştiğinde **🎯**, kontrol 3 kez üst üste hata verirse **⚠️**, iş tamamlandığında ise kendi cron kaydını silip **✅** mesajı gönderir.
-
----
-
-## ⚙️ Ortam Değişkenleri (Opsiyonel)
-
-| Değişken | Açıklama | Varsayılan |
+| Variable | Description | Default |
 |---|---|---|
-| `DS_TELEGRAM_CONFIG` | Config dosyasının yolu | `~/.config/ds/telegram.json` |
-| `TELEGRAM_BOT_TOKEN` | Config yerine env üzerinden token | — |
-| `TELEGRAM_CHAT_ID` | Config yerine env üzerinden chat ID | — |
-| `TELEGRAM_LABEL` | Mesajların ilk satırındaki kalın başlık | `<hostname> · <klasör_adı>` |
+| `TELEGRAM_CONFIG` | Path to config JSON (also checks legacy `DS_TELEGRAM_CONFIG`) | `~/.config/telegram/config.json` |
+| `TELEGRAM_BOT_TOKEN` | Bot token via env (skips config file) | — |
+| `TELEGRAM_CHAT_ID` | Linked private chat ID via env | — |
+| `TELEGRAM_LABEL` | Bold header on the first line of every message | `<hostname> · <folder>` |
+| `TELEGRAM_STATE_DIR` | Directory for `cursor.json`, `active.json`, and `inbox/` | `~/.local/state/telegram` |
+| `TELEGRAM_OWNER` | Custom owner ID for `--resume` lock checks | `OPENCODE_SESSION_ID` / `CLAUDE_SESSION_ID` / `cwd` |
 
 ---
 
-## 📁 Repo Yapısı
+## 🔒 Privacy & Security
+
+- **Direct to Telegram:** Talks straight to `api.telegram.org` — no third-party relay server in the middle.
+- **Locked to your chat:** Only messages and button taps from your own linked `chat_id` are accepted; anyone else messaging your bot is ignored.
+- **Local secrets only:** Token and chat ID live in `~/.config/telegram/config.json` with `0600` permissions.
+
+---
+
+## 📁 Repo Layout
 
 ```text
 .
-├── telegram.py                  # Sıfır bağımlılıklı ana CLI aracı (Python 3)
-├── install.sh                   # PATH ve Claude Code skill kurulum betiği
-└── skills/
-    ├── tg/SKILL.md              # Claude Code /tg (uzaktan görev & onay) skill'i
-    └── notification/SKILL.md    # Claude Code /notification (cron nöbetçi) skill'i
+├── telegram.py                     # Zero-dependency Python 3 CLI (default: watch)
+├── install.sh                      # Installs CLI + symlinks skills for Claude Code & OpenCode
+├── skills/
+│   ├── tgpush/SKILL.md             # Push updates, files & inline button approvals
+│   └── tgwatch/SKILL.md            # Live two-way watch with automatic session handoff
+├── commands/opencode/
+│   ├── tgpush.md                   # /tgpush slash command for OpenCode
+│   └── tgwatch.md                  # /tgwatch slash command for OpenCode
+└── LICENSE                         # MIT
 ```

@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
-"""Reach me on Telegram from any shell or Claude Code session: notify, send files, ask and wait.
+"""Zero-dependency Telegram bridge for shells and AI coding agents: watch, send, ask, and share files.
 
-Config: ~/.config/ds/telegram.json {"token", "chat_id"}, written by `telegram setup`
-(or env TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID). Messages are headed with "host · dir"
-(override: TELEGRAM_LABEL) so it is clear which machine and project is talking.
+Config: ~/.config/telegram/config.json {"token", "chat_id"} (legacy fallback:
+~/.config/ds/telegram.json), written by `telegram setup` (or env TELEGRAM_BOT_TOKEN /
+TELEGRAM_CHAT_ID). Messages are headed with "host · dir" (override: TELEGRAM_LABEL).
 
-Nothing is stored locally and updates are never confirmed (Telegram keeps them 24h),
-so any number of devices can share one bot. Only messages from the linked chat count.
+Updates are never confirmed on Telegram's side (Telegram keeps them 24h), so multiple
+devices can share one bot. Locally, `telegram watch` enforces a single active watcher
+with software-driven handoff (active.json + SIGUSR1) so a new session cleanly stops
+the previous watcher and tells its agent not to restart.
 """
 import argparse
 import getpass
 import json
 import os
+import select
+import signal
 import socket
 import sys
 import time
@@ -20,10 +24,28 @@ import urllib.request
 import uuid
 
 API = os.environ.get('TELEGRAM_API', 'https://api.telegram.org')
-CONFIG = os.path.expanduser(os.environ.get('DS_TELEGRAM_CONFIG', '~/.config/ds/telegram.json'))
+STATE_DIR = os.path.expanduser(os.environ.get('TELEGRAM_STATE_DIR', '~/.local/state/telegram'))
+DEFAULT_CURSOR = os.path.join(STATE_DIR, 'cursor.json')
+DEFAULT_INBOX = os.path.join(STATE_DIR, 'inbox')
+ACTIVE_FILE = os.path.join(STATE_DIR, 'active.json')
 LABEL = os.environ.get('TELEGRAM_LABEL') or f'{socket.gethostname()} · {os.path.basename(os.getcwd())}'
 MAX_PARTS = 3  # longer text goes as a .txt file instead of a burst of messages
+EXIT_STOPPED = 10  # exited cleanly because another session took over or `telegram stop` ran
 TOKEN = CHAT = None
+
+
+def resolve_config_path():
+    env_path = os.environ.get('TELEGRAM_CONFIG') or os.environ.get('DS_TELEGRAM_CONFIG')
+    if env_path:
+        return os.path.expanduser(env_path)
+    primary = os.path.expanduser('~/.config/telegram/config.json')
+    legacy = os.path.expanduser('~/.config/ds/telegram.json')
+    if not os.path.exists(primary) and os.path.exists(legacy):
+        return legacy
+    return primary
+
+
+CONFIG = resolve_config_path()
 
 # IPv4 first: urllib tries addresses in order, and a broken IPv6 route (common) stalls every call until timeout
 _getaddrinfo = socket.getaddrinfo
@@ -196,95 +218,270 @@ def download_media(m, dest_dir):
         return None
 
 
-def read_cursor(path):
+def atomic_write_json(path, payload):
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    tmp = f'{path}.{os.getpid()}.{uuid.uuid4().hex[:6]}.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(payload, f)
+    os.replace(tmp, path)
+
+
+def read_json(path):
     try:
         with open(path) as f:
-            return int(json.load(f).get('last_update_id', 0))
+            data = json.load(f)
+            return data if isinstance(data, dict) else None
     except (OSError, ValueError, TypeError):
         return None
 
 
+def read_cursor(path):
+    data = read_json(path)
+    if not data:
+        return None
+    try:
+        return int(data['last_update_id'])
+    except (KeyError, ValueError, TypeError):
+        return None
+
+
 def write_cursor(path, update_id):
-    d = os.path.dirname(path)
-    if d:
-        os.makedirs(d, exist_ok=True)
-    tmp = f'{path}.{os.getpid()}.tmp'
-    with open(tmp, 'w') as f:
-        json.dump({'last_update_id': int(update_id), 'ts': int(time.time())}, f)
-    os.replace(tmp, path)
+    atomic_write_json(path, {'last_update_id': int(update_id), 'ts': int(time.time())})
 
 
-def cmd_wait(a):
-    """Block until one or more new messages arrive from the linked chat; resilient to 409/network blips."""
+def default_owner():
+    return (
+        os.environ.get('TELEGRAM_OWNER')
+        or os.environ.get('OPENCODE_SESSION_ID')
+        or os.environ.get('CLAUDE_SESSION_ID')
+        or f'cwd:{os.getcwd()}'
+    )
+
+
+def pid_alive(pid):
+    if not isinstance(pid, int) or pid <= 1 or pid == os.getpid():
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    cmdline = f'/proc/{pid}/cmdline'
+    if os.path.exists(cmdline):
+        try:
+            with open(cmdline, 'rb') as f:
+                raw = f.read().decode('utf-8', 'ignore')
+            if 'telegram' not in raw and 'python' not in raw:
+                return False
+        except OSError:
+            pass
+    return True
+
+
+def terminate_watcher(pid, grace=2.5):
+    """Ask an existing watcher to emit [STOP] and exit via SIGUSR1; fall back to SIGTERM if hung."""
+    if not pid_alive(pid):
+        return False
+    try:
+        os.kill(pid, signal.SIGUSR1)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return False
+    deadline = time.time() + grace
+    while time.time() < deadline:
+        if not pid_alive(pid):
+            return True
+        time.sleep(0.05)
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        pass
+    deadline = time.time() + 0.5
+    while time.time() < deadline:
+        if not pid_alive(pid):
+            return True
+        time.sleep(0.05)
+    return True
+
+
+def emit_stop(as_json, reason, by_label=None, by_owner=None):
+    if reason == 'stopped':
+        msg = f'Telegram watch was stopped{f" by {by_label}" if by_label else ""}. Stop listening and do NOT restart telegram watch.'
+    else:
+        who = by_label or by_owner or 'another session'
+        msg = f'Telegram watch handed off to another session ({who}). Stop listening and do NOT restart telegram watch.'
+    if as_json:
+        payload = {'event': 'stop', 'reason': reason, 'message': msg}
+        if by_label:
+            payload['by'] = by_label
+        if by_owner:
+            payload['owner'] = by_owner
+        print(json.dumps(payload, ensure_ascii=False), flush=True)
+    else:
+        print(f'[STOP] {msg}', flush=True)
+    sys.exit(EXIT_STOPPED)
+
+
+def cmd_stop(a):
+    prev = read_json(ACTIVE_FILE)
+    atomic_write_json(ACTIVE_FILE, {
+        'stopped': True,
+        'by': LABEL,
+        'ts': int(time.time()),
+    })
+    if prev and not prev.get('stopped') and pid_alive(prev.get('pid')):
+        terminate_watcher(prev['pid'])
+        print(f"Stopped active watcher ({prev.get('label') or prev.get('owner')}, pid {prev['pid']}).")
+    else:
+        print('No active watcher running.')
+
+
+def cmd_watch(a):
+    """Block until one or more new messages arrive; enforces single active local watcher with clean handoff."""
     cursor_path = os.path.expanduser(a.cursor)
-    last_id = a.since if a.since is not None else read_cursor(cursor_path)
+    download_dir = '' if a.no_download else os.path.expanduser(a.download)
+    my_owner = a.owner or default_owner()
+    my_token = uuid.uuid4().hex
+    prev = read_json(ACTIVE_FILE)
 
-    def fetch_safe():
-        backoff = a.interval
-        while True:
-            try:
-                return updates()
-            except OSError:
-                time.sleep(backoff)
-                backoff = min(backoff * 1.5, 15.0)
-            except TgError as e:
-                if e.code not in (409, 429) and e.code < 500:
-                    raise
-                time.sleep(backoff)
-                backoff = min(backoff * 1.5, 15.0)
+    if a.resume:
+        # Only resume if this session still owns the slot AND no other watcher is already live
+        if not prev or prev.get('stopped'):
+            emit_stop(a.json, 'stopped', prev.get('by') if prev else None)
+        if prev.get('owner') != my_owner or pid_alive(prev.get('pid')):
+            emit_stop(a.json, 'handed_off', prev.get('label'), prev.get('owner'))
 
-    if last_id is None:
-        ups = fetch_safe()
-        last_id = max((u['update_id'] for u in ups), default=0)
-        write_cursor(cursor_path, last_id)
+    # Atomically claim ownership BEFORE signaling the previous watcher so it immediately reads who took over
+    atomic_write_json(ACTIVE_FILE, {
+        'pid': os.getpid(),
+        'token': my_token,
+        'owner': my_owner,
+        'label': LABEL,
+        'started_at': int(time.time()),
+    })
 
-    deadline = (time.time() + a.timeout) if a.timeout > 0 else None
-    batch_until = None
-    collected = []
+    if prev and not prev.get('stopped') and prev.get('pid') != os.getpid():
+        if terminate_watcher(prev.get('pid')):
+            who = prev.get('label') or prev.get('owner') or f"pid {prev.get('pid')}"
+            print(f'Took over watch from {who} (pid {prev.get("pid")}).', file=sys.stderr, flush=True)
 
-    while True:
-        ups = fetch_safe()
-        fresh = [
-            u for u in ups
-            if u['update_id'] > last_id and u.get('message', {}).get('chat', {}).get('id') == CHAT
-        ]
-        if fresh:
-            collected.extend(fresh)
-            last_id = max(u['update_id'] for u in fresh)
-            write_cursor(cursor_path, last_id)
-            if batch_until is None:
-                batch_until = time.time() + a.batch
-        if collected and (a.batch <= 0 or time.time() >= batch_until):
-            out = []
-            for u in collected:
-                m = u['message']
-                saved = download_media(m, a.download)
-                r = m.get('reply_to_message')
-                item = {
-                    'update_id': u['update_id'],
-                    'message_id': m['message_id'],
-                    'date': m['date'],
-                    'text': text_of(m),
-                }
-                if saved:
-                    item['file'] = saved
-                if r:
-                    item['reply_to'] = (r.get('text') or r.get('caption') or '').split('\n', 1)[-1][:120]
-                out.append(item)
-            if a.json:
-                print(json.dumps(out, ensure_ascii=False))
-            else:
-                for it in out:
-                    line = time.strftime('%F %T', time.localtime(it['date'])) + '  ' + it['text']
-                    if 'file' in it:
-                        line += f"  [file: {it['file']}]"
-                    if 'reply_to' in it:
-                        line += f"  (reply to: {it['reply_to']})"
-                    print(line)
+    # Async-signal-safe wakeup pipe so SIGUSR1 interrupts sleep in <1ms (bypasses PEP 475 sleep retry)
+    wake_r, wake_w = os.pipe()
+    os.set_blocking(wake_r, False)
+    os.set_blocking(wake_w, False)
+    prev_wakeup_fd = signal.set_wakeup_fd(wake_w, warn_on_full_buffer=False)
+    signaled = {'usr1': False}
+
+    def on_usr1(_sig, _frame):
+        signaled['usr1'] = True
+
+    signal.signal(signal.SIGUSR1, on_usr1)
+
+    def check_ownership():
+        cur = read_json(ACTIVE_FILE)
+        if signaled['usr1'] or not cur or cur.get('token') != my_token:
+            if cur and cur.get('stopped'):
+                emit_stop(a.json, 'stopped', cur.get('by'))
+            emit_stop(a.json, 'handed_off', cur.get('label') if cur else None, cur.get('owner') if cur else None)
+
+    def sleep_or_wake(seconds):
+        if seconds <= 0:
+            check_ownership()
             return
-        if deadline is not None and time.time() >= deadline:
-            sys.exit(124)
-        time.sleep(0.5 if collected else a.interval)
+        try:
+            ready, _, _ = select.select([wake_r], [], [], seconds)
+            if ready:
+                try:
+                    os.read(wake_r, 64)
+                except BlockingIOError:
+                    pass
+        except InterruptedError:
+            pass
+        check_ownership()
+
+    try:
+        last_id = a.since if a.since is not None else read_cursor(cursor_path)
+
+        def fetch_safe():
+            backoff = a.interval
+            while True:
+                check_ownership()
+                try:
+                    ups = updates()
+                    check_ownership()
+                    return ups
+                except OSError:
+                    sleep_or_wake(backoff)
+                    backoff = min(backoff * 1.5, 15.0)
+                except TgError as e:
+                    if e.code not in (409, 429) and e.code < 500:
+                        raise
+                    sleep_or_wake(backoff)
+                    backoff = min(backoff * 1.5, 15.0)
+
+        if last_id is None:
+            ups = fetch_safe()
+            last_id = max((u['update_id'] for u in ups), default=0)
+            write_cursor(cursor_path, last_id)
+
+        deadline = (time.time() + a.timeout) if a.timeout > 0 else None
+        batch_until = None
+        collected = []
+
+        while True:
+            ups = fetch_safe()
+            fresh = [
+                u for u in ups
+                if u['update_id'] > last_id and u.get('message', {}).get('chat', {}).get('id') == CHAT
+            ]
+            if fresh:
+                collected.extend(fresh)
+                last_id = max(u['update_id'] for u in fresh)
+                write_cursor(cursor_path, last_id)
+                if batch_until is None:
+                    batch_until = time.time() + a.batch
+            if collected and (a.batch <= 0 or time.time() >= batch_until):
+                out = []
+                for u in collected:
+                    m = u['message']
+                    saved = download_media(m, download_dir)
+                    r = m.get('reply_to_message')
+                    item = {
+                        'update_id': u['update_id'],
+                        'message_id': m['message_id'],
+                        'date': m['date'],
+                        'text': text_of(m),
+                    }
+                    if saved:
+                        item['file'] = saved
+                    if r:
+                        item['reply_to'] = (r.get('text') or r.get('caption') or '').split('\n', 1)[-1][:120]
+                    out.append(item)
+                if a.json:
+                    print(json.dumps(out, ensure_ascii=False), flush=True)
+                else:
+                    for it in out:
+                        line = time.strftime('%F %T', time.localtime(it['date'])) + '  ' + it['text']
+                        if 'file' in it:
+                            line += f"  [file: {it['file']}]"
+                        if 'reply_to' in it:
+                            line += f"  (reply to: {it['reply_to']})"
+                        print(line, flush=True)
+                return
+            if deadline is not None and time.time() >= deadline:
+                sys.exit(124)
+            sleep_or_wake(0.5 if collected else a.interval)
+    finally:
+        signal.set_wakeup_fd(prev_wakeup_fd)
+        for fd in (wake_r, wake_w):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 
 def cmd_send(a):
@@ -376,9 +573,31 @@ def cmd_setup(a):
     print(f'Other devices: copy that file, or run: telegram setup <token> {CHAT}')
 
 
+def add_watch_parser(sub, name, help_text):
+    s = sub.add_parser(name, help=help_text)
+    s.add_argument('--resume', action='store_true', help='continue watching only if this session still owns the watch lock')
+    s.add_argument('--owner', default=None, help='session owner id (default: TELEGRAM_OWNER / OPENCODE_SESSION_ID / CLAUDE_SESSION_ID / cwd)')
+    s.add_argument('--cursor', default=DEFAULT_CURSOR, help=f'cursor file path (default: {DEFAULT_CURSOR})')
+    s.add_argument('--since', type=int, default=None, help='override last seen update_id')
+    s.add_argument('-t', '--timeout', type=float, default=0, help='max seconds to wait (0 = forever, default)')
+    s.add_argument('--interval', type=float, default=2.5, help='poll interval seconds (default 2.5)')
+    s.add_argument('--batch', type=float, default=1.5, help='seconds to batch rapid consecutive messages')
+    s.add_argument('--download', default=DEFAULT_INBOX, help=f'directory for incoming media (default: {DEFAULT_INBOX})')
+    s.add_argument('--no-download', action='store_true', help='do not download incoming photos/documents/voice')
+    s.add_argument('--json', action='store_true', help='print incoming messages (or stop events) as JSON')
+    s.set_defaults(fn=cmd_watch)
+
+
 def main():
-    p = argparse.ArgumentParser(prog='telegram', description='Reach me on Telegram: notify, send files, ask and wait for an answer.')
+    p = argparse.ArgumentParser(
+        prog='telegram',
+        description='Zero-dependency Telegram bridge for shells & AI agents. Running `telegram` with no subcommand starts `watch`.',
+    )
     sub = p.add_subparsers(dest='cmd', required=True)
+    add_watch_parser(sub, 'watch', '(default) watch for incoming messages with single-session handoff')
+    add_watch_parser(sub, 'wait', argparse.SUPPRESS)  # backward-compatible alias for `watch`
+    s = sub.add_parser('stop', help='gracefully stop any active local watcher')
+    s.set_defaults(fn=cmd_stop)
     s = sub.add_parser('send', help='send a message (args, or piped stdin); very long text goes as a .txt file')
     s.add_argument('text', nargs='*')
     s.set_defaults(fn=cmd_send)
@@ -394,22 +613,18 @@ def main():
     s = sub.add_parser('list', help='your messages of the last 24h')
     s.add_argument('n', nargs='?', type=int, default=10)
     s.set_defaults(fn=cmd_list)
-    s = sub.add_parser('wait', help='wait continuously for new incoming messages (persists cursor, retries errors)')
-    s.add_argument('--cursor', default='~/.local/state/ds-telegram/cursor.json', help='cursor file path')
-    s.add_argument('--since', type=int, default=None, help='override last seen update_id')
-    s.add_argument('-t', '--timeout', type=float, default=0, help='max seconds to wait (0 = forever, default)')
-    s.add_argument('--interval', type=float, default=2.5, help='poll interval seconds (default 2.5)')
-    s.add_argument('--batch', type=float, default=1.5, help='seconds to batch rapid consecutive messages')
-    s.add_argument('--download', default='', help='directory to save incoming photos/documents/voice')
-    s.add_argument('--json', action='store_true', help='print incoming messages as JSON')
-    s.set_defaults(fn=cmd_wait)
     s = sub.add_parser('setup', help='save the bot token and link your chat')
     s.add_argument('token', nargs='?')
     s.add_argument('chat_id', nargs='?', type=int)
     s.set_defaults(fn=cmd_setup)
-    a = p.parse_args()
 
-    if a.cmd != 'setup':
+    known = {'watch', 'wait', 'stop', 'send', 'file', 'ask', 'list', 'setup', '-h', '--help'}
+    argv = sys.argv[1:]
+    if not argv or argv[0] not in known:
+        argv = ['watch'] + argv
+    a = p.parse_args(argv)
+
+    if a.cmd not in ('setup', 'stop'):
         load()
     try:
         a.fn(a)
